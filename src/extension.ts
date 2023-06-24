@@ -5,23 +5,15 @@ export function activate(context: vscode.ExtensionContext) {
   let disposable = vscode.commands.registerCommand(
     "build-runner.quickly",
     async () => {
-      function _route(): Array<String> | null {
-        /// Get the current editor file uri and path
-        const uri = vscode.window.activeTextEditor?.document.uri;
-        const path = uri?.path;
-
-        /// Guard against welcome screen
-        const isWelcomeScreen = path === undefined;
-        if (isWelcomeScreen) return null;
-
+      function _baseFolder(path: string): string | null {
         /// Guard against untitled files
         const isUntitled = vscode.window.activeTextEditor?.document.isUntitled;
-        if (isUntitled) return [];
+        if (isUntitled) return null;
 
         /// Guard against no workspace name
         const workspaceFolder = vscode.workspace.getWorkspaceFolder(uri!);
         const workspaceName = workspaceFolder?.name;
-        if (workspaceName === undefined) return [];
+        if (workspaceName === undefined) return null;
 
         /// Guard against no workspace path
         const workspacePath = workspaceFolder?.uri.path;
@@ -32,7 +24,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         /// Guard against no top level folder
         const hasTopLevelFolder = segments!.length > 1;
-        if (!hasTopLevelFolder) return [];
+        if (!hasTopLevelFolder) return null;
 
         const segmentsWithoutFilename = [...segments!].slice(
           0,
@@ -41,13 +33,17 @@ export function activate(context: vscode.ExtensionContext) {
         const bottomLevelFolder = `${workspacePath}/${segmentsWithoutFilename.join(
           "/"
         )}`;
+        return bottomLevelFolder;
+      }
+
+      function _route(path: string): Array<String> | null {
         const targetFile = path;
 
         /// Guard against common generated files
         const targetIsFreezed = targetFile?.endsWith(".freezed.dart");
         const targetIsGenerated = targetFile?.endsWith(".g.dart");
-        if (targetIsFreezed) return [`${bottomLevelFolder}/**`];
-        if (targetIsGenerated) return [`${bottomLevelFolder}/**`];
+        if (targetIsFreezed) return [`/**`];
+        if (targetIsGenerated) return [`/**`];
 
         /// get parts
         const text = vscode.window.activeTextEditor?.document.getText();
@@ -61,31 +57,48 @@ export function activate(context: vscode.ExtensionContext) {
           parts?.length === 0
         );
 
-        if (!hasParts) return [`${bottomLevelFolder}/**`];
+        if (!hasParts) return [`/**`];
 
-        const buildFilters = parts!.map((e) => `${bottomLevelFolder}/${e}`);
+        const buildFilters = parts!.map((e) => `/${e}`);
 
         return [...buildFilters];
       }
 
-      const filters = await _route();
+      /// Get the current editor file uri and path
+      const uri = vscode.window.activeTextEditor?.document.uri;
+      const documentPath = uri?.path;
+
+      /// Guard against welcome screen
+      const isWelcomeScreen = documentPath === undefined;
+      if (isWelcomeScreen) {
+        vscode.window.showInformationMessage(
+          `Please select a project to run build_runner in`
+        );
+        return;
+      }
+
+      const bottomLevelFolder = _baseFolder(documentPath!);
+      const filters = await _route(documentPath)?.map(
+        (pattern) => `${bottomLevelFolder}${pattern}`
+      );
+
       /// get dart configuration
       const config =  vscode.workspace.getConfiguration('dart');
       /// get chosen workspace SDK path
       const flutterSdkPath = config.get('flutterSdkPath');
       /// generate path
       const commandPrefix =
-          flutterSdkPath == null ? `dart` : `${flutterSdkPath}/bin/dart`;
+        flutterSdkPath == null ? `dart` : `${flutterSdkPath}/bin/dart`;
 
       /// Null filters because no workspace, let's ask the user to pick a workspace
       /// so we can run build_runner on it
-      if (filters === null) {
+      if (filters === null || filters === undefined) {
         /// Pick a workspace folder
         const result = await vscode.window.showWorkspaceFolderPick();
-        const path = result?.uri.path;
+        const workspaceFolderPath = result?.uri.path;
 
         /// No workspace selected intentionally
-        if (path === undefined) {
+        if (workspaceFolderPath === undefined) {
           vscode.window.showInformationMessage(
             `Please select a project to run build_runner in`
           );
@@ -93,31 +106,63 @@ export function activate(context: vscode.ExtensionContext) {
 
         /// Workspace selected, lets run build_runner on it
         else {
-          const command = `cd ${path} && ${commandPrefix} run build_runner build --delete-conflicting-outputs`;
+          const command = `cd ${workspaceFolderPath} && ${commandPrefix} run build_runner build --delete-conflicting-outputs`;
           const terminal = vscode.window.createTerminal(`build_runner`);
 
-          terminal.sendText(command);
+          terminal.sendText(`${command};exit`);
           console.log(command);
           vscode.window.showInformationMessage(`Running build_runner quickly`);
+
+          var disposeListener = vscode.window.onDidCloseTerminal((e) => {
+            if (e.name === `build_runner`) {
+              vscode.window.showInformationMessage(`build_runner process finished`);
+              disposeListener.dispose();
+            }
+          });
         }
       }
       /// We've got an array which means everything worked out.
       /// It might be empty, but that's not a problem. That just
       /// means we won't have any build filters.
       else {
-        const buildFilters = filters
+        const buildFilters = filters!
           .map((path) => `--build-filter="${path}"`)
           .join(" ");
 
+        async function _findPackageBaseFolder(
+          folder: string
+        ): Promise<string | undefined> {
+          if (folder === "/") return undefined;
+
+          const hasPubspec = await vscode.workspace
+            .findFiles(new vscode.RelativePattern(folder, "pubspec.yaml"))
+            .then((e) => e.length > 0);
+          if (hasPubspec) return folder;
+          return _findPackageBaseFolder(
+            folder.split("/").slice(0, -1).join("/")
+          );
+        }
+        const packageBaseFolder = await _findPackageBaseFolder(
+          bottomLevelFolder!
+        );
+
         const terminal = vscode.window.createTerminal(`build_runner`);
 
-
-        const command = `${commandPrefix} run build_runner build --delete-conflicting-outputs ${buildFilters}`;
+        const command = `${
+          packageBaseFolder ? `cd ${packageBaseFolder} && ` : ''
+        }${commandPrefix} run build_runner build --delete-conflicting-outputs ${buildFilters}`;
 
         /// Attempt to build with filters
-        terminal.sendText(command);
+        terminal.sendText(`${command};exit`);
         console.log(command);
         vscode.window.showInformationMessage(`Running build_runner quickly`);
+
+        var disposeListener = vscode.window.onDidCloseTerminal((e) => {
+          if (e.name === `build_runner`) {
+            vscode.window.showInformationMessage(`build_runner process finished`);
+            disposeListener.dispose();
+          }
+        });
       }
     }
   );
